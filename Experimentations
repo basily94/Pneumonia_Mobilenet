@@ -1,0 +1,313 @@
+#################################################sample diff planner agent trial and error
+
+from pydantic import BaseModel, Field
+from typing import List, Optional
+
+INSTRUCTIONS = (
+    "You are a planning agent for safe Java dependency upgrades. "
+    "Given (ga, vulnerable_version) and a dependency_tree, your job is to output a working required URLS only. "
+    "Do NOT pick a fixed version. "
+    "Produce concrete URLs (Maven metadata, Maven Central search or artifact page) and good candidates for changelog URLs. "
+    "Keep dependency convergence in mind (e.g., sibling modules) if its helps in giving correct URLS"
+)
+
+class FixResearchItem(BaseModel):
+
+
+    # Use plain strings for URLs to avoid the 'uri' format rejection
+    vulnerable_version: str = Field(description="The vulnerable version")
+    
+    maven_metadata_url: str = Field(
+        description="Direct link to maven-metadata.xml on repo1 (must start with http/https)"
+    )
+
+
+    # changelog discovery
+    changelog_urls: List[str] = Field(
+        default_factory=list,
+        description="Best-guess direct changelog/release notes URLs (http/https)"
+    )
+
+
+class FixResearchUrl(BaseModel):
+    items: List[FixResearchItem] = Field(description="One entry per vulnerable item")
+
+
+
+vulnerable_items = [
+        {"ga": "org.apache.tomcat.embed:tomcat-embed-core", "version": "10.1.14"},
+         #{"ga": "org.hibernate.orm:hibernate-core", "version": "6.0.10"}
+ ]
+
+
+
+input_text = (
+    "Analyze the following dependency tree and vulnerable items.\n\n"
+    f"Dependency tree:\n{dependency_tree}\n\n"
+    f"Vulnerable items (JSON):\n{json.dumps(vulnerable_items, indent=2)}\n"
+    "Return a FixResearchUrl."
+)
+
+
+planner_agent = Agent(
+    name="PlannerAgent",
+    instructions=INSTRUCTIONS,
+    model="gpt-4o-mini",
+    output_type=FixResearchUrl,
+)
+
+
+## important urls changelog urls https://tomcat.apache.org/tomcat-10.1-doc/changelog.html
+
+with trace("Search"):
+    result = await Runner.run(planner_agent, input_text )
+    print(result.final_output)
+
+
+
+
+INSTRUCTIONS = (
+
+   f"take urls from previous versions {input.maven_xml} and {input.change_log}"
+    
+
+)
+
+
+search_agent = Agent(
+    name="Search agent",
+    instructions=INSTRUCTIONS,
+    tools=[analyze_url_for_versions_or_changelog],
+    model="gpt-4o-mini",
+    model_settings=ModelSettings(tool_choice="required"),
+)
+
+
+
+import re
+import requests
+from typing import List, Dict, Any, Tuple
+from xml.etree import ElementTree as ET
+from bs4 import BeautifulSoup
+
+# -----------------------------
+# Version helpers
+# -----------------------------
+
+def _semver_key(v: str) -> Tuple[int, ...]:
+    """
+    Turn '10.1.14' or '11.0.0-M5' into a comparable tuple.
+    Milestones / prereleases (M, RC, alpha, beta, SNAPSHOT) sort *after* real releases.
+    """
+    nums = [int(x) for x in re.findall(r'\d+', v)]
+    # Push milestone/RC/snapshot style versions to the end if mixed in
+    is_prerelease = bool(re.search(r'(M\d+|RC\d+|alpha|beta|SNAPSHOT)', v, re.I))
+    return (*nums, 1 if is_prerelease else 0)
+
+
+def _next_patch_versions(versions: List[str], vulnerable: str, limit: int = 7) -> List[str]:
+    """
+    From the full list of versions, return up to 'limit' versions strictly > vulnerable,
+    sorted in ascending order. No restriction to same major.minor – that decision is left
+    to the LLM later.
+    """
+    versions_sorted = sorted(versions, key=_semver_key)
+    return [
+        v for v in versions_sorted
+        if _semver_key(v) > _semver_key(vulnerable)
+    ][:limit]
+
+
+# -----------------------------
+# Maven metadata
+# -----------------------------
+
+def _parse_maven_metadata(url: str) -> List[str]:
+    """Fetch maven-metadata.xml and return all <version> values as strings."""
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    xml = ET.fromstring(r.text)
+    return [el.text.strip() for el in xml.findall(".//version") if el.text]
+
+
+# -----------------------------
+# Changelog scraping helpers
+# -----------------------------
+
+def _collect_notes_from_block(block) -> List[str]:
+    """
+    Gather bullet-like notes from a DOM block:
+    - Prefer <li> items
+    - Fallback to splitting text into lines
+    """
+    notes = []
+
+    # 1) <li> bullets
+    for li in getattr(block, 'find_all', lambda *_: [])('li'):
+        txt = li.get_text(" ", strip=True)
+        if txt:
+            notes.append(txt)
+
+    # 2) If no <li>, fallback to text lines
+    if not notes:
+        text_lines = block.get_text("\n", strip=True).split("\n")
+        for line in text_lines:
+            clean = re.sub(r'\s+', ' ', line).strip()
+            if clean:
+                notes.append(clean)
+
+    return notes
+
+
+def _extract_version_section(soup: BeautifulSoup, version: str) -> List[str]:
+    """
+    Find a heading that mentions the exact version (e.g., '10.1.15' somewhere in the text),
+    then collect bullets / paragraphs until the next heading of the same or higher level.
+    """
+    heading_tags = ['h1', 'h2', 'h3', 'h4']
+    ver_pat = re.compile(rf'\b{re.escape(version)}\b')
+
+    for h in soup.find_all(heading_tags):
+        if ver_pat.search(h.get_text(" ", strip=True) or ""):
+            notes = []
+            # Walk siblings until the next heading
+            for sib in h.next_siblings:
+                if getattr(sib, 'name', None) in heading_tags:
+                    break
+                notes.extend(_collect_notes_from_block(sib))
+
+            # De-dup / normalize
+            uniq = []
+            seen = set()
+            for n in notes:
+                if n not in seen:
+                    uniq.append(n)
+                    seen.add(n)
+
+            return uniq[:12] if uniq else []
+    return []  # not found
+
+
+# -----------------------------
+# Main analysis function
+# -----------------------------
+@function_tool
+def analyze_url_for_versions_or_changelog(
+    url: str,
+    vulnerable_version: str,
+    limit_next: int = 7
+) -> Dict[str, Any]:
+    """
+    Analyze a Maven metadata or changelog URL.
+
+    If 'url' is a maven-metadata.xml:
+      - Fetch all available versions.
+      - Sort them with _semver_key (stable first, prereleases later).
+      - Compute 'selected_fix_versions' = next up to `limit_next` versions strictly > vulnerable_version,
+        with NO restriction to same major.minor (LLM decides later if cross-major is acceptable).
+
+      Returns:
+      {
+        "url": ...,
+        "type": "metadata",
+        "vulnerable_version": "...",
+        "vulnerable_series": "MAJOR.MINOR",
+        "available_versions": [...],
+        "selected_fix_versions": [...]
+      }
+
+    Otherwise, treat 'url' as a changelog page:
+      - Attempt to find headings that mention version numbers (x.y.z).
+      - From those, pick up to `limit_next` versions strictly > vulnerable_version.
+      - For each selected version, extract notes under its section.
+
+      Returns:
+      {
+        "url": ...,
+        "type": "changelog",
+        "vulnerable_version": "...",
+        "selected_fix_versions": [...],
+        "changelog_summary": {
+          "<ver>": {"status": "ok" | "not_found_in_changelog", "bullets": [...]}
+        }
+      }
+    """
+    out: Dict[str, Any] = {
+        "url": url,
+        "vulnerable_version": vulnerable_version,
+    }
+
+    # --- Case 1: Maven metadata ---
+    if url.endswith("maven-metadata.xml"):
+        all_versions = _parse_maven_metadata(url)
+        selected = _next_patch_versions(all_versions, vulnerable_version, limit=limit_next)
+
+        out.update({
+            "type": "metadata",
+            "vulnerable_series": ".".join(vulnerable_version.split(".")[:2]),
+            "available_versions": sorted(all_versions, key=_semver_key),
+            "selected_fix_versions": selected,
+        })
+        return out
+
+    # --- Case 2: Changelog page ---
+    r = requests.get(url, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # Try to discover candidate versions from headings on the page
+    cand = set()
+    for h in soup.find_all(['h1', 'h2', 'h3', 'h4']):
+        text = h.get_text(" ", strip=True) or ""
+        for m in re.finditer(r'\b(\d+\.\d+\.\d+)\b', text):
+            v = m.group(1)
+            if _semver_key(v) > _semver_key(vulnerable_version):
+                cand.add(v)
+
+    selected_versions = sorted(cand, key=_semver_key)[:limit_next]
+
+    # Extract notes for each selected version
+    summary: Dict[str, Dict[str, Any]] = {}
+    for v in selected_versions:
+        notes = _extract_version_section(soup, v)
+        if notes:
+            summary[v] = {"status": "ok", "bullets": notes[:12]}
+        else:
+            summary[v] = {"status": "not_found_in_changelog", "bullets": []}
+
+    out.update({
+        "type": "changelog",
+        "selected_fix_versions": selected_versions,
+        "changelog_summary": summary,
+    })
+    return out
+
+
+async def plan_searches(input_text: str):
+    """ Use the planner_agent to plan which searches to run for the vulnerable version """
+    print("Planning searches...")
+    result = await Runner.run(planner_agent, f"input_items: {input_text}")
+    print(f"Will perform {len(result.final_output.items)} items")
+    return result.final_output
+
+async def perform_searches(search_plan: WebSearchPlan):
+    """ Call search() for each item in the search plan """
+    print("Searching...")
+    tasks = [asyncio.create_task(search(item)) for item in search_plan.items]
+    results = await asyncio.gather(*tasks)
+    print(results)
+    print("Finished searching")
+    return results
+
+async def search(item: WebSearchItem):
+    """ Use the search agent to run a web search for only urls in the search plan """
+    input = f"Search with mentioned URLS url to get relevant details as to understand which \
+    version upgrade will be better: {item.maven_metadata_url}{item.changelog_urls}"
+    result = await Runner.run(search_agent, input)
+    return result.final_output
+
+with trace("Research trace"):
+    print("Starting research...")
+    search_plan = await plan_searches(input_text)
+    search_results = await perform_searches(search_plan)
+    print(search_results)
