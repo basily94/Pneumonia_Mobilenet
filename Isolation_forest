@@ -1,0 +1,288 @@
+"""
+End-to-end demo:
+- Synthetic log dataset
+- Rule-based checks (duplicates + special chars)
+- Feature engineering
+- IsolationForest anomaly detection (trained on GOOD data only)
+"""
+
+import re
+import math
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+
+
+# -------------------------------------------------------------------
+# 1. CREATE SYNTHETIC LOG DATASET
+# -------------------------------------------------------------------
+
+def create_synthetic_logs():
+    """
+    Returns a list of log lines and a label indicating if we consider it GOOD (1) or BAD (0)
+    for training/demo purposes.
+    In real life, you'd only train on known-good data; here we mark them explicitly.
+    """
+    good_logs = [
+        "2025-11-18 10:00:01 INFO  [user=alice] Login successful",
+        "2025-11-18 10:00:02 INFO  [user=bob] Login successful",
+        "2025-11-18 10:00:03 ERROR [user=alice] Failed to load profile",
+        "2025-11-18 10:00:04 INFO  [user=carol] Password changed",
+        "2025-11-18 10:00:05 WARN  [user=dave] Password attempt limit near",
+        "2025-11-18 10:00:06 INFO  [user=eric] Logout successful",
+        "2025-11-18 10:00:07 INFO  [user=frank] Login successful",
+        "2025-11-18 10:00:08 DEBUG [user=system] Cache refreshed",
+    ]
+
+    # BAD / anomalous logs
+    bad_logs = [
+        # spelling stretched
+        "2025-11-18 10:00:09 INFO  [user=alice] Loginnnn successfulllllll",
+        # random junk
+        "2025-11-18 10:00:10 INFO  [user=???] asd9as8d9as8d9as8d9",
+        # strange symbols
+        "2025-11-18 10:00:11 INFO  [user=bob] Login successful ✔✔✔",
+        # weird structure
+        "LOGIN_OK user=carol ts=2025-11-18T10:00:12Z src=mobile extra_field=!!!",
+        # extreme repetition
+        "2025-11-18 10:00:13 INFO  [user=dave] LLLLLLLLLLLLLLLLLLLLLLLLLLLLL",
+    ]
+
+    # Add a duplicate of an existing good log to simulate duplicate record
+    duplicate_log = "2025-11-18 10:00:01 INFO  [user=alice] Login successful"
+
+    all_logs = good_logs + bad_logs + [duplicate_log]
+
+    # Label GOOD = 1, BAD = 0 (for inspection; IsolationForest will only use GOOD rows)
+    labels = (
+        [1] * len(good_logs) +  # good
+        [0] * len(bad_logs) +   # bad
+        [1]                     # duplicate of a good log (also 'good' content-wise)
+    )
+
+    return all_logs, labels
+
+
+def logs_to_dataframe():
+    logs, labels = create_synthetic_logs()
+    df = pd.DataFrame({"line": logs, "is_good_label": labels})
+    return df
+
+
+# -------------------------------------------------------------------
+# 2. RULE-BASED CHECKS (DUPLICATES + SPECIAL CHARACTERS)
+# -------------------------------------------------------------------
+
+ALLOWED_PATTERN = re.compile(r'^[A-Za-z0-9 ,._\-:/\[\]\(\)=@\+]+$')
+
+def find_duplicate_lines(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rule-based: duplicates are identical log lines.
+    """
+    dup_mask = df.duplicated(subset=["line"], keep=False)
+    return df[dup_mask].reset_index(drop=True)
+
+
+def find_lines_with_special_chars(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rule-based: any line that contains chars outside the allowed pattern.
+    """
+    bad_indices = []
+    for idx, text in df["line"].items():
+        if not ALLOWED_PATTERN.match(text):
+            bad_indices.append(idx)
+    return df.loc[bad_indices].reset_index(drop=True)
+
+
+# -------------------------------------------------------------------
+# 3. FEATURE ENGINEERING FOR ANOMALY DETECTION
+# -------------------------------------------------------------------
+
+def char_entropy(s: str) -> float:
+    """
+    Shannon entropy of characters in the string.
+    Higher entropy = more randomness. Extreme repetition => lower entropy.
+    """
+    if not s:
+        return 0.0
+    counts = Counter(s)
+    total = len(s)
+    ent = 0.0
+    for c in counts.values():
+        p = c / total
+        ent -= p * math.log2(p)
+    return ent
+
+
+def max_repeat_streak(s: str) -> int:
+    """
+    Longest run of the same character.
+    e.g. 'hellooo' -> 3
+    """
+    if not s:
+        return 0
+    max_streak = 1
+    current_streak = 1
+    for i in range(1, len(s)):
+        if s[i] == s[i - 1]:
+            current_streak += 1
+            if current_streak > max_streak:
+                max_streak = current_streak
+        else:
+            current_streak = 1
+    return max_streak
+
+
+def basic_char_stats(s: str):
+    """
+    Returns (len, digit_ratio, alpha_ratio, space_ratio, other_ratio)
+    """
+    if not s:
+        return 0, 0, 0, 0, 0
+    total = len(s)
+    digits = sum(c.isdigit() for c in s)
+    alpha = sum(c.isalpha() for c in s)
+    spaces = sum(c.isspace() for c in s)
+    other = total - digits - alpha - spaces
+    return (
+        total,
+        digits / total,
+        alpha / total,
+        spaces / total,
+        other / total,
+    )
+
+
+def token_stats(s: str):
+    """
+    Token-level stats: token count, avg token length, max token length.
+    """
+    tokens = s.split()
+    if not tokens:
+        return 0, 0.0, 0
+    lengths = [len(t) for t in tokens]
+    return len(tokens), float(sum(lengths) / len(tokens)), max(lengths)
+
+
+def featurize_logs(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a feature matrix for each log line.
+    (For demo we do simple stats; you could add embeddings here.)
+    """
+    feature_rows = []
+
+    for line in df["line"]:
+        length, digit_ratio, alpha_ratio, space_ratio, other_ratio = basic_char_stats(line)
+        entropy_val = char_entropy(line)
+        max_rep = max_repeat_streak(line)
+        tok_count, avg_tok_len, max_tok_len = token_stats(line)
+
+        feature_rows.append(
+            {
+                "len": length,
+                "digit_ratio": digit_ratio,
+                "alpha_ratio": alpha_ratio,
+                "space_ratio": space_ratio,
+                "other_ratio": other_ratio,
+                "entropy": entropy_val,
+                "max_repeat": max_rep,
+                "token_count": tok_count,
+                "avg_token_len": avg_tok_len,
+                "max_token_len": max_tok_len,
+            }
+        )
+
+    feat_df = pd.DataFrame(feature_rows)
+    return feat_df
+
+
+# -------------------------------------------------------------------
+# 4. TRAIN ISOLATION FOREST ON GOOD DATA ONLY
+# -------------------------------------------------------------------
+
+def train_isolation_forest(features: pd.DataFrame, good_mask: pd.Series) -> IsolationForest:
+    """
+    Train IsolationForest on GOOD rows only.
+    """
+    X_good = features[good_mask].values
+
+    # You can tune n_estimators, contamination etc. as needed.
+    iso = IsolationForest(
+        n_estimators=100,
+        contamination=0.1,   # expected fraction of anomalies (rough guess for scoring)
+        random_state=42,
+    )
+    iso.fit(X_good)
+    return iso
+
+
+def score_anomalies(model: IsolationForest, features: pd.DataFrame) -> np.ndarray:
+    """
+    Returns anomaly scores. Lower score = more anomalous (per sklearn convention).
+    """
+    scores = model.decision_function(features.values)
+    return scores
+
+
+# -------------------------------------------------------------------
+# 5. TIE IT ALL TOGETHER
+# -------------------------------------------------------------------
+
+def main():
+    # 1) Create dataset
+    df = logs_to_dataframe()
+    print("=== ALL LOG LINES ===")
+    print(df, "\n")
+
+    # 2) Rule-based checks
+    dup_df = find_duplicate_lines(df)
+    special_df = find_lines_with_special_chars(df)
+
+    print("=== RULE-BASED: DUPLICATE LINES ===")
+    print(dup_df, "\n")
+
+    print("=== RULE-BASED: SPECIAL CHAR LINES ===")
+    print(special_df, "\n")
+
+    # Decide bad_by_rules flag: if a line is duplicate or has special chars
+    bad_by_rules_mask = df.index.isin(dup_df.index) | df.index.isin(special_df.index)
+    df["bad_by_rules"] = bad_by_rules_mask
+
+    # 3) Feature engineering
+    feat_df = featurize_logs(df)
+
+    print("=== FEATURE MATRIX (HEAD) ===")
+    print(feat_df.head(), "\n")
+
+    # 4) Train IsolationForest on GOOD data only
+    # Here we use the is_good_label column: in real life, you'd take historical known-good only.
+    good_mask_for_training = (df["is_good_label"] == 1) & (~df["bad_by_rules"])
+
+    model = train_isolation_forest(feat_df, good_mask_for_training)
+
+    # 5) Score anomalies for all lines
+    anomaly_scores = score_anomalies(model, feat_df)
+    df["anomaly_score"] = anomaly_scores
+
+    # Lower score => more anomalous, so let's sort ascending
+    df_sorted = df.sort_values("anomaly_score")
+
+    print("=== LOGS SORTED BY ANOMALY (LOWEST SCORE = MOST ANOMALOUS) ===")
+    print(df_sorted[["line", "is_good_label", "bad_by_rules", "anomaly_score"]], "\n")
+
+    # For convenience, let's mark the file-level status
+    any_bad_by_rules = df["bad_by_rules"].any()
+    any_heavily_anomalous = (df["anomaly_score"] < -0.1).any()  # threshold is tunable
+
+    if any_bad_by_rules or any_heavily_anomalous:
+        file_status = "BAD"
+    else:
+        file_status = "GOOD"
+
+    print(f"=== OVERALL FILE STATUS (RULES + ANOMALY MODEL): {file_status} ===")
+
+
+if __name__ == "__main__":
+    main()
