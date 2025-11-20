@@ -1,0 +1,53 @@
+Here are the *MVN_BASE, **CENTRAL_DIR, and **GitHub Releases API* URLs (changelog URLs) for each of the child-IDs you listed, following the same pattern as for Jetty.
+You can then plug these into your tool for each artifact.
+If you like, I can format them as a JSON map for programmatic usage.
+
+| Artifact                                          | MVN_BASE                                                                             | CENTRAL_DIR                                                                       | GitHub Owner/Repo & Releases API URL                                                                                                                                     |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Byte Buddy                                        | https://mvnrepository.com/artifact/net.bytebuddy/byte-buddy                        | https://repo1.maven.org/maven2/net/bytebuddy/byte-buddy/                        | Owner: bytebuddy<br>Repo: byte-buddy<br>https://api.github.com/repos/bytebuddy/byte-buddy/releases                                                                 |
+| Spring Pulsar                                     | https://mvnrepository.com/artifact/org.springframework.pulsar/spring-pulsar        | https://repo1.maven.org/maven2/org/springframework/pulsar/spring-pulsar/        | Owner: spring-projects ? or springframework ? <br>Possible: spring-projects/spring-pulsar<br>https://api.github.com/repos/spring-projects/spring-pulsar/releases |
+| Maven Invoker Plugin                              | https://mvnrepository.com/artifact/org.apache.maven.plugins/maven-invoker-plugin   | https://repo1.maven.org/maven2/org/apache/maven/plugins/maven-invoker-plugin/   | Owner: apache<br>Repo: maven-invoker-plugin<br>https://api.github.com/repos/apache/maven-invoker-plugin/releases                                                   |
+| Maven Jar Plugin                                  | https://mvnrepository.com/artifact/org.apache.maven.plugins/maven-jar-plugin       | https://repo1.maven.org/maven2/org/apache/maven/plugins/maven-jar-plugin/       | Owner: apache<br>Repo: maven-jar-plugin<br>https://api.github.com/repos/apache/maven-jar-plugin/releases                                                           |
+| Jakarta XML WS                                    | https://mvnrepository.com/artifact/jakarta.xml.ws/jakarta.xml.ws-api               | https://repo1.maven.org/maven2/jakarta/xml/ws/jakarta.xml.ws-api/               | Owner: eclipse-ee4j<br>Repo: jakarta.xml.ws<br>https://api.github.com/repos/eclipse-ee4j/jakarta.xml.ws/releases                                                   |
+| R2DBC Proxy                                       | https://mvnrepository.com/artifact/io.r2dbc/r2dbc-proxy                            | https://repo1.maven.org/maven2/io/r2dbc/r2dbc-proxy/                            | Owner: r2dbc<br>Repo: r2dbc-proxy<br>https://api.github.com/repos/r2dbc/r2dbc-proxy/releases                                                                       |
+| Spring Data BOM                                   | https://mvnrepository.com/artifact/org.springframework.data/spring-data-bom        | https://repo1.maven.org/maven2/org/springframework/data/spring-data-bom/        | Owner: spring-projects<br>Repo: spring-data (or spring-data-bom?)<br>https://api.github.com/repos/spring-projects/spring-data/releases                           |
+| Spring Session                                    | https://mvnrepository.com/artifact/org.springframework.session/spring-session-core | https://repo1.maven.org/maven2/org/springframework/session/spring-session-core/ | Owner: spring-projects<br>Repo: spring-session<br>https://api.github.com/repos/spring-projects/spring-session/releases                                             |
+| Hibernate                                         | https://mvnrepository.com/artifact/org.hibernate/hibernate-core                    | https://repo1.maven.org/maven2/org/hibernate/hibernate-core/                    | Owner: hibernate<br>Repo: hibernate-orm<br>https://api.github.com/repos/hibernate/hibernate-orm/releases                                                           |
+| Infinispan                                        | https://mvnrepository.com/artifact/org.infinispan/infinispan-core                  | https://repo1.maven.org/maven2/org/infinispan/infinispan-core/                  | Owner: infinispan<br>Repo: infinispan<br>https://api.github.com/repos/infinispan/infinispan/releases                                                               |
+| Tomcat                                            | https://mvnrepository.com/artifact/org.apache.tomcat/tomcat-catalina               | https://repo1.maven.org/maven2/org/apache/tomcat/tomcat-catalina/               | Owner: apache<br>Repo: tomcat<br>https://api.github.com/repos/apache/tomcat/releases                                                                               |
+| Pooled JMS                                        | https://mvnrepository.com/artifact/org.apache.activemq/activemq-pool               | https://repo1.maven.org/maven2/org/apache/activemq/activemq-pool/               | Owner: apache<br>Repo: activemq (or activemq-pool plugin) <br>https://api.github.com/repos/apache/activemq/releases                                              |
+| Micrometer                                        | https://mvnrepository.com/artifact/io.micrometer/micrometer-core                   | https://repo1.maven.org/maven2/io/micrometer/micrometer-core/                   | Owner: micrometer-metrics<br>Repo: micrometer<br>https://api.github.com/repos/micrometer-metrics/micrometer/releases                                               |
+| Availability (Spring Boot Actuator availability?) | https://mvnrepository.com/artifact/org.springframework.boot/spring-boot-actuator   | https://repo1.maven.org/maven2/org/springframework/boot/spring-boot-actuator/   | Owner: spring-projects<br>Repo: spring-boot (or spring-boot-actuator) <br>https://api.github.com/repos/spring-projects/spring-boot/releases                      |
+| Httpcores (Apache HttpComponents)                 | https://mvnrepository.com/artifact/org.apache.httpcomponents/httpcore              | https://repo1.maven.org/maven2/org/apache/httpcomponents/httpcore/              | Owner: apache<br>Repo: httpcomponents-core (or httpcomponents/httpcore) <br>https://api.github.com/repos/apache/httpcomponents-core/releases                     |
+
+
+
+If you like, I can *generate a properly formatted dictionary or JSON file* mapping each artifact to these three URLs, ready for your tool to read and use
+
+--------------------------new links
+
+
+byte buddy changelog
+https://github.com/raphw/byte-buddy/releases
+central
+https://repo1.maven.org/maven2/net/bytebuddy/byte-buddy/
+mvn 
+https://mvnrepository.com/artifact/net.bytebuddy/byte-buddy
+
+spring-pulsar changelog
+https://api.github.com/repos/spring-projects/spring-pulsar/releases
+mvn
+https://mvnrepository.com/artifact/org.springframework.pulsar/spring-pulsar
+central
+https://repo1.maven.org/maven2/org/springframework/pulsar/spring-pulsar/
+
+working
+Maven Invoker Plugin
+https://mvnrepository.com/artifact/org.apache.maven.plugins/maven-invoker-plugin
+https://repo1.maven.org/maven2/org/apache/maven/plugins/maven-invoker-plugin/
+Owner: apache
+Repo: maven-invoker-plugin
+https://api.github.com/repos/apache/maven-invoker-plugin/releases
+
+
+working changelog for r2d2 https://github.com/r2dbc/r2dbc-proxy/blob/main/CHANGELOG
