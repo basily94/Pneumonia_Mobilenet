@@ -1,0 +1,340 @@
+########### working implementations ###########
+
+# jetty_next_version_tool.py
+# Async tool for FalconFix/Target Suggestion workflows.
+# - Finds the smallest Jetty version strictly greater than `from_version` on mvnrepository
+# - Falls back to Maven Central directory listing if needed
+# - Fetches full changelog from GitHub Releases (API first, HTML fallback)
+#
+# Usage in your agent:
+#   from jetty_next_version_tool import jetty_version_tool
+#   result = await jetty_version_tool({"from_version": "12.0.15"})
+#   print(result["next_version"])
+#   print(result["changelog_markdown"][:800])
+#
+# Setup:
+#   pip install playwright aiohttp beautifulsoup4 packaging
+#   python -m playwright install chromium
+#   # optional to avoid GitHub rate limits:
+#   export GITHUB_TOKEN=ghp_...
+
+import os
+import re
+import asyncio
+from typing import Dict, Any, List, Optional, Tuple
+
+from packaging.version import Version, InvalidVersion
+from bs4 import BeautifulSoup
+import aiohttp
+from playwright.async_api import async_playwright
+
+MVN_BASE = "https://mvnrepository.com/artifact/org.eclipse.jetty/jetty-server"
+CENTRAL_DIR = "https://repo1.maven.org/maven2/org/eclipse/jetty/jetty-server/"
+GITHUB_OWNER = "jetty"
+GITHUB_REPO = "jetty.project"
+GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases"
+GITHUB_TAGS_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/tags"
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+
+
+# ---------- Helpers ----------
+
+def _norm_tag_candidates(version: str) -> List[str]:
+    v = version.strip()
+    return [f"jetty-{v}", f"v{v}", v, f"release-{v}"]
+
+def _github_headers() -> dict:
+    h = {"Accept": "application/vnd.github+json", "User-Agent": UA}
+    tok = os.getenv("GITHUB_TOKEN")
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+def _uniform_version_key(v: str) -> Tuple[int, ...]:
+    """
+    Always return a tuple so sorting is consistent across valid/invalid strings.
+    (0, *release_tuple) for valid versions → sorts before (1, ...)
+    """
+    try:
+        ver = Version(v)
+        return (0, *ver.release)  # e.g., (0, 12, 0, 16)
+    except InvalidVersion:
+        parts = re.split(r"[.\-+]", v)
+        nums = [int(p) if p.isdigit() else -1 for p in parts]
+        return (1, *nums)
+
+def _extract_versions_from_mvn_html(html: str) -> List[str]:
+    """
+    Restrict parsing to the versions table/grid to avoid stray links.
+    Accept only strict dotted versions like 12.0.16 (2–4 segments).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    dotted = re.compile(r"^\d+(?:\.\d+){1,3}$")
+    versions: List[str] = []
+
+    container = soup.select_one(".grid.versions") or soup.select_one("#maincontent") or soup
+    # Rows may be in a table or grid; scan both patterns
+    rows = container.select("table tr") + container.select(".grid .im")
+    if not rows:  # fallback: scan anchors under main content
+        rows = [container]
+
+    for row in rows:
+        for a in row.find_all("a", href=True):
+            t = (a.get_text(strip=True) or "")
+            if dotted.fullmatch(t):
+                versions.append(t)
+
+    # unique, preserve order
+    seen, out = set(), []
+    for v in versions:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+def _mvn_page_url(page: int) -> str:
+    return MVN_BASE if page <= 1 else f"{MVN_BASE}?p={page}"
+
+
+# ---------- Maven Central fallback ----------
+
+async def _central_list_versions(session: aiohttp.ClientSession) -> List[str]:
+    """
+    Parse Apache directory listing for jetty-server on Maven Central.
+    Returns versions like '12.0.16'.
+    """
+    async with session.get(CENTRAL_DIR, headers={"User-Agent": UA}, timeout=aiohttp.ClientTimeout(total=30)) as r:
+        r.raise_for_status()
+        html = await r.text()
+    soup = BeautifulSoup(html, "html.parser")
+    dotted = re.compile(r"^\d+(?:\.\d+){1,3}/$")
+    versions: List[str] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if dotted.fullmatch(href):
+            versions.append(href.strip("/"))
+    return versions
+
+
+# ---------- Task 1: find next version on mvnrepository with Central fallback ----------
+
+async def _find_next_version(from_version: str, max_pages: int = 25) -> str:
+    try:
+        base = Version(from_version)
+    except InvalidVersion:
+        raise ValueError(f"from_version '{from_version}' is not a valid version")
+
+    # 1) Try mvnrepository (pagination) with Playwright
+    all_versions: List[str] = []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent=UA)
+        page = await context.new_page()
+        page.set_default_timeout(25_000)
+
+        for page_i in range(1, max_pages + 1):
+            url = _mvn_page_url(page_i)
+            await page.goto(url, wait_until="domcontentloaded")
+            html = await page.content()
+            page_versions = _extract_versions_from_mvn_html(html)
+            if not page_versions:
+                break
+            all_versions.extend(page_versions)
+            await asyncio.sleep(0.1)
+
+        await context.close()
+        await browser.close()
+
+    # unique
+    seen, uniq = set(), []
+    for v in all_versions:
+        if v not in seen:
+            seen.add(v)
+            uniq.append(v)
+
+    # strictly-greater set from mvnrepository
+    greater_mvn: List[str] = []
+    for v in uniq:
+        try:
+            if Version(v) > base:
+                greater_mvn.append(v)
+        except InvalidVersion:
+            pass
+
+    # 2) If mvnrepository list looks incomplete or empty, use Central as authoritative
+    use_central = (not greater_mvn) or (base.public not in uniq)
+    if use_central:
+        async with aiohttp.ClientSession() as session:
+            central_versions = await _central_list_versions(session)
+        greater_central = [v for v in central_versions if Version(v) > base]
+        if not greater_central:
+            raise RuntimeError(f"No version greater than {from_version} found on Maven Central.")
+        return sorted(greater_central, key=_uniform_version_key)[0]
+
+    # Otherwise, pick minimal strictly-greater from mvnrepository
+    return sorted(greater_mvn, key=_uniform_version_key)[0]
+
+
+# ---------- Task 2: changelog from GitHub (API → HTML fallback) ----------
+
+async def _fetch_release_via_api(session: aiohttp.ClientSession, version: str) -> Optional[dict]:
+    headers = _github_headers()
+    # scan releases pages (up to 500 items)
+    for page in range(1, 6):
+        url = f"{GITHUB_RELEASES_API}?per_page=100&page={page}"
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status == 403:
+                # naive backoff if rate-limited
+                await asyncio.sleep(1.5)
+                continue
+            r.raise_for_status()
+            releases = await r.json()
+        if not releases:
+            break
+
+        v_lc = version.lower()
+        for rel in releases:
+            tag = (rel.get("tag_name") or "").lower()
+            name = (rel.get("name") or "").lower()
+            if v_lc in tag or v_lc in name:
+                return rel
+            for cand in _norm_tag_candidates(version):
+                c = cand.lower()
+                if c == tag or c in tag or c in name:
+                    return rel
+
+    # fallback: list tags then /releases/tags/{tag}
+    for page in range(1, 6):
+        url = f"{GITHUB_TAGS_API}?per_page=100&page={page}"
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as r:
+            r.raise_for_status()
+            tags = await r.json()
+        if not tags:
+            break
+        names = {t.get("name") for t in tags if "name" in t}
+
+        for cand in _norm_tag_candidates(version):
+            if cand in names:
+                u = f"{GITHUB_RELEASES_API}/tags/{cand}"
+                async with session.get(u, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as rr:
+                    if rr.status == 200:
+                        return await rr.json()
+    return None
+
+async def _fetch_release_html(version: str) -> Optional[Tuple[str, str]]:
+    """
+    Returns (text, url) if found by scraping the HTML release page, else None.
+    """
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent=UA)
+        page = await context.new_page()
+        page.set_default_timeout(25_000)
+
+        for tag in _norm_tag_candidates(version):
+            url = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/tag/{tag}"
+            try:
+                await page.goto(url, wait_until="domcontentloaded")
+            except Exception:
+                continue
+            html = await page.content()
+            soup = BeautifulSoup(html, "html.parser")
+            body = soup.select_one(".markdown-body")
+            if body:
+                text = body.get_text("\n", strip=True)
+                if text:
+                    await context.close()
+                    await browser.close()
+                    return text, url
+
+        await context.close()
+        await browser.close()
+
+    return None
+
+async def _get_changelog_and_meta(version: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    Returns (changelog_markdown, release_meta_dict).
+    release_meta_dict may include tag, html_url, published_at, name.
+    """
+    release_meta: Dict[str, Any] = {}
+    async with aiohttp.ClientSession() as session:
+        rel = await _fetch_release_via_api(session, version)
+        if rel:
+            body = (rel.get("body") or rel.get("body_text") or "").strip()
+            if body:
+                # strip images to keep it text-only (optional)
+                body = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", body).strip()
+                release_meta = {
+                    "tag": rel.get("tag_name"),
+                    "html_url": rel.get("html_url"),
+                    "published_at": rel.get("published_at"),
+                    "name": rel.get("name"),
+                }
+                return body, release_meta
+
+    # HTML fallback
+    html_result = await _fetch_release_html(version)
+    if html_result:
+        text, url = html_result
+        release_meta = {
+            "tag": None,
+            "html_url": url,
+            "published_at": None,
+            "name": f"Jetty {version}",
+        }
+        return text.strip(), release_meta
+
+    raise RuntimeError(f"Changelog not found for Jetty {version} on GitHub releases.")
+
+
+# ---------- Public entry: FalconFix tool ----------
+
+async def jetty_version_tool(input_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Tool entrypoint for your agent.
+
+    input_data:
+        {
+          "artifact": "org.eclipse.jetty:jetty-server",  # optional; fixed for now
+          "from_version": "12.0.15"
+        }
+
+    returns JSON payload with next_version + full changelog.
+    """
+    artifact = input_data.get("artifact") or "org.eclipse.jetty:jetty-server"
+    from_version = input_data.get("from_version")
+    if not from_version:
+        raise ValueError("from_version is required, e.g. '12.0.15'.")
+
+    if artifact != "org.eclipse.jetty:jetty-server":
+        raise ValueError(f"Unsupported artifact '{artifact}'. Supported: org.eclipse.jetty:jetty-server")
+
+    next_version = await _find_next_version(from_version)
+    changelog_md, release_meta = await _get_changelog_and_meta(next_version)
+
+    payload = {
+        "artifact": "org.eclipse.jetty:jetty-server",
+        "from_version": from_version,
+        "next_version": next_version,
+        "release": release_meta,
+        "changelog_markdown": changelog_md,
+        "sources": {
+            "maven_listing": MVN_BASE,
+            "maven_central_dir": CENTRAL_DIR,
+            "github_releases_api": GITHUB_RELEASES_API,
+            "github_release_page": release_meta.get("html_url"),
+        },
+    }
+    return payload
+
+
+# ---------- Manual quick test ----------
+# if __name__ == "__main__":
+#     import json
+#     res = asyncio.run(jetty_version_tool({"from_version": "12.0.15"}))
+#     print(json.dumps(res, indent=2)[:2000])
+ 
+result = await jetty_version_tool({"from_version": "12.0.19"})
+print(result["next_version"])                 # should be 12.0.16
+print(result["changelog_markdown"][:9800])     # full notes available
