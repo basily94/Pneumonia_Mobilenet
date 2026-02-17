@@ -1,0 +1,21 @@
+# FalconFix v3 Dependencies
+# =========================
+
+# OpenAI API for LLM calls
+openai>=1.0.0
+
+# HTTP client for API calls
+aiohttp>=3.8.0
+
+# HTML parsing for changelog extraction
+beautifulsoup4>=4.12.0
+
+# Browser automation for fallback changelog fetching
+playwright>=1.40.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# Note: After installing, run:
+# python -m playwright install chromium
+
